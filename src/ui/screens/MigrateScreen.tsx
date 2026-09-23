@@ -34,6 +34,18 @@ export const MigrateScreen: React.FC<MigrateScreenProps> = ({
   const engineRef = useRef<MigrationEngine | null>(null);
 
   useEffect(() => {
+    let wakeLockSentinel: { release: () => Promise<void> } | null = null;
+    const requestWakeLock = async () => {
+      if ('wakeLock' in navigator) {
+        try {
+          wakeLockSentinel = await (navigator as unknown as { wakeLock: { request: (type: string) => Promise<{ release: () => Promise<void> }> } }).wakeLock.request('screen');
+        } catch {
+          // Ignorar si no está soportado o permitido
+        }
+      }
+    };
+    requestWakeLock();
+
     const engine = new MigrationEngine((p) => {
       setProgress(p);
       if (p.completedItems + p.failedItems + p.skippedItems >= p.totalItems && p.totalItems > 0) {
@@ -55,6 +67,9 @@ export const MigrateScreen: React.FC<MigrateScreenProps> = ({
 
     return () => {
       engine.pause();
+      if (wakeLockSentinel) {
+        wakeLockSentinel.release().catch(() => {});
+      }
     };
   }, [selectedSubscriptions, selectedPlaylists]);
 

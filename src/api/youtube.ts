@@ -16,34 +16,50 @@ export class YouTubeApiError extends Error {
   }
 }
 
-async function apiFetch<T>(endpoint: string, token: string, options: RequestInit = {}): Promise<T> {
+async function apiFetch<T>(endpoint: string, token: string, options: RequestInit = {}, retries = 2): Promise<T> {
   const url = endpoint.startsWith('http') ? endpoint : `${API_BASE}${endpoint}`;
-  const response = await fetch(url, {
-    ...options,
-    headers: {
-      'Authorization': `Bearer ${token}`,
-      'Accept': 'application/json',
-      'Content-Type': 'application/json',
-      ...options.headers
-    }
-  });
 
-  if (!response.ok) {
-    let errorJson: { error?: { message?: string; errors?: Array<{ reason?: string; message?: string }> } } = {};
+  for (let attempt = 0; attempt <= retries; attempt++) {
     try {
-      errorJson = await response.json();
-    } catch {
-      // Ignorar fallo de parseo
+      const response = await fetch(url, {
+        ...options,
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'Accept': 'application/json',
+          'Content-Type': 'application/json',
+          ...options.headers
+        }
+      });
+
+      if (!response.ok) {
+        let errorJson: { error?: { message?: string; errors?: Array<{ reason?: string; message?: string }> } } = {};
+        try {
+          errorJson = await response.json();
+        } catch {
+          // Ignorar fallo de parseo
+        }
+
+        const firstError = errorJson.error?.errors?.[0];
+        const reason = firstError?.reason;
+        const message = firstError?.message || errorJson.error?.message || `Error HTTP ${response.status} en YouTube API`;
+
+        throw new YouTubeApiError(message, response.status, reason, errorJson);
+      }
+
+      return await (response.json() as Promise<T>);
+    } catch (err) {
+      if (err instanceof YouTubeApiError) {
+        throw err;
+      }
+      if (attempt < retries) {
+        await new Promise((resolve) => setTimeout(resolve, 1500));
+        continue;
+      }
+      throw err;
     }
-
-    const firstError = errorJson.error?.errors?.[0];
-    const reason = firstError?.reason;
-    const message = firstError?.message || errorJson.error?.message || `Error HTTP ${response.status} en YouTube API`;
-
-    throw new YouTubeApiError(message, response.status, reason, errorJson);
   }
 
-  return response.json() as Promise<T>;
+  throw new Error('Error inesperado en apiFetch');
 }
 
 // 1. Obtener canal del usuario autenticado (mine=true)

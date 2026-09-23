@@ -88,65 +88,22 @@ export class MigrationEngine {
       return token.accessToken;
     };
 
-    // 1. Migrar Suscripciones
-    for (const sub of selectedSubscriptions) {
-      if (this.isPaused) {
-        this.report('Migración en pausa', totalItems, completed, failed, skipped);
-        return;
-      }
-
-      if (sub.status === 'completada') {
-        skipped++;
-        this.report(`Suscripción omitida (ya completada): ${sub.title}`, totalItems, completed, failed, skipped);
-        continue;
-      }
-
-      this.report(`Suscribiendo a: ${sub.title}...`, totalItems, completed, failed, skipped);
-
-      try {
-        const targetToken = getTargetToken();
-        const newSubId = await createSubscription(targetToken, sub.channelId);
-
-        sub.status = 'completada';
-        sub.targetSubscriptionId = newSubId;
-        await db.subscriptions.put(sub);
-        completed++;
-
-        // Delay de cortesía para respetar límites de tasa de YouTube (800ms)
-        await this.delay(800);
-      } catch (err: unknown) {
-        if (err instanceof YouTubeApiError && err.status === 401) {
-          this.pause();
-          this.report('Sesión expirada. Por favor renueva el token de destino.', totalItems, completed, failed, skipped, err.message);
-          throw err;
-        }
-
-        if (err instanceof YouTubeApiError && err.reason === 'subscriptionRateLimitExceeded') {
-          this.pause();
-          sub.status = 'fallida';
-          sub.errorMessage = 'Límite diario de suscripciones de YouTube alcanzado';
-          await db.subscriptions.put(sub);
-          this.report('Límite de suscripciones de YouTube alcanzado para hoy', totalItems, completed, failed, skipped, sub.errorMessage);
-          throw err;
-        }
-
-        failed++;
-        sub.status = 'fallida';
-        sub.errorMessage = err instanceof Error ? err.message : 'Error desconocido';
-        await db.subscriptions.put(sub);
-      }
-    }
-
-    // 2. Migrar Listas de Reproducción y sus vídeos
+    // 1. MIGRAR PRIMERO LAS LISTAS DE REPRODUCCIÓN Y SUS VÍDEOS
     for (const playlist of selectedPlaylists) {
       if (this.isPaused) {
         this.report('Migración en pausa', totalItems, completed, failed, skipped);
         return;
       }
 
+      if (playlist.status === 'completada' && playlist.targetPlaylistId) {
+        skipped++;
+        this.report(`Lista ya completada: ${playlist.title}`, totalItems, completed, failed, skipped);
+        continue;
+      }
+
       let targetPlaylistId = playlist.targetPlaylistId;
 
-      // Crear lista en destino si no se ha creado todavía
+      // Crear lista en destino si no existe
       if (!targetPlaylistId) {
         this.report(`Creando lista: ${playlist.title}...`, totalItems, completed, failed, skipped);
         try {
@@ -162,8 +119,20 @@ export class MigrationEngine {
           playlist.status = 'en_curso';
           await db.playlists.put(playlist);
           completed++;
-          await this.delay(800);
+          await this.delay(1000);
         } catch (err: unknown) {
+          if (err instanceof YouTubeApiError) {
+            if (err.status === 401) {
+              this.pause();
+              this.report('Autorización caducada. Por favor renueva la conexión.', totalItems, completed, failed, skipped, err.message);
+              throw err;
+            }
+            if (err.reason === 'quotaExceeded' || err.message.includes('quota')) {
+              this.pause();
+              this.report('Cuota diaria de YouTube alcanzada (10.000 pts). Continúa mañana.', totalItems, completed, failed, skipped, 'Cuota diaria agotada');
+              throw err;
+            }
+          }
           failed++;
           playlist.status = 'fallida';
           playlist.errorMessage = err instanceof Error ? err.message : 'Error al crear la lista';
@@ -190,29 +159,97 @@ export class MigrationEngine {
           return;
         }
 
-        this.report(`Añadiendo vídeo: ${video.title} a ${playlist.title}...`, totalItems, completed, failed, skipped);
+        this.report(`Añadiendo vídeo (${video.position + 1}/${videos.length}): ${video.title} a ${playlist.title}...`, totalItems, completed, failed, skipped);
 
         try {
           const targetToken = getTargetToken();
           await addVideoToPlaylist(targetToken, targetPlaylistId, video.videoId);
           completed++;
-          await this.delay(800);
+          await this.delay(1000);
         } catch (err: unknown) {
-          // Si el vídeo fue borrado o es privado, se omite limpiamente
-          if (err instanceof YouTubeApiError && (err.status === 404 || err.reason === 'videoNotFound')) {
-            skipped++;
-            video.status = 'omitida';
-            video.errorMessage = 'Vídeo no disponible o eliminado';
-          } else {
-            failed++;
-            video.status = 'fallida';
-            video.errorMessage = err instanceof Error ? err.message : 'Error al añadir vídeo';
+          if (err instanceof YouTubeApiError) {
+            if (err.status === 401) {
+              this.pause();
+              this.report('Autorización caducada. Por favor renueva la conexión.', totalItems, completed, failed, skipped, err.message);
+              throw err;
+            }
+            if (err.reason === 'quotaExceeded' || err.message.includes('quota')) {
+              this.pause();
+              this.report('Cuota diaria de YouTube alcanzada (10.000 pts). Continúa mañana.', totalItems, completed, failed, skipped, 'Cuota diaria agotada');
+              throw err;
+            }
+            if (err.status === 404 || err.reason === 'videoNotFound') {
+              skipped++;
+              video.status = 'omitida';
+              video.errorMessage = 'Vídeo no disponible o eliminado';
+              continue;
+            }
           }
+
+          failed++;
+          video.status = 'fallida';
+          video.errorMessage = err instanceof Error ? err.message : 'Error al añadir vídeo';
         }
       }
 
       playlist.status = 'completada';
       await db.playlists.put(playlist);
+    }
+
+    // 2. MIGRAR SUSCRIPCIONES
+    for (const sub of selectedSubscriptions) {
+      if (this.isPaused) {
+        this.report('Migración en pausa', totalItems, completed, failed, skipped);
+        return;
+      }
+
+      if (sub.status === 'completada') {
+        skipped++;
+        continue;
+      }
+
+      this.report(`Suscribiendo a: ${sub.title}...`, totalItems, completed, failed, skipped);
+
+      try {
+        const targetToken = getTargetToken();
+        const newSubId = await createSubscription(targetToken, sub.channelId);
+
+        sub.status = 'completada';
+        sub.targetSubscriptionId = newSubId;
+        await db.subscriptions.put(sub);
+        completed++;
+
+        // Delay de cortesía espaciado para respetar límites de YouTube
+        await this.delay(1200);
+      } catch (err: unknown) {
+        if (err instanceof YouTubeApiError) {
+          if (err.status === 401) {
+            this.pause();
+            this.report('Sesión expirada. Por favor renueva el token de destino.', totalItems, completed, failed, skipped, err.message);
+            throw err;
+          }
+
+          if (err.reason === 'subscriptionRateLimitExceeded') {
+            this.pause();
+            sub.status = 'fallida';
+            sub.errorMessage = 'Límite diario de suscripciones de YouTube alcanzado';
+            await db.subscriptions.put(sub);
+            this.report('Límite de suscripciones de YouTube alcanzado para hoy', totalItems, completed, failed, skipped, sub.errorMessage);
+            throw err;
+          }
+
+          if (err.reason === 'quotaExceeded' || err.message.includes('quota')) {
+            this.pause();
+            this.report('Cuota diaria de YouTube alcanzada (10.000 pts). Continúa mañana.', totalItems, completed, failed, skipped, 'Cuota diaria agotada');
+            throw err;
+          }
+        }
+
+        failed++;
+        sub.status = 'fallida';
+        sub.errorMessage = err instanceof Error ? err.message : 'Error desconocido';
+        await db.subscriptions.put(sub);
+      }
     }
 
     this.report('¡Migración finalizada con éxito!', totalItems, completed, failed, skipped);
