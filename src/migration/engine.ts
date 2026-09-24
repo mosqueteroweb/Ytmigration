@@ -88,7 +88,63 @@ export class MigrationEngine {
       return token.accessToken;
     };
 
-    // 1. MIGRAR PRIMERO LAS LISTAS DE REPRODUCCIÓN Y SUS VÍDEOS
+    // 1. MIGRAR PRIMERO LAS SUSCRIPCIONES (Prioridad solicitada)
+    for (const sub of selectedSubscriptions) {
+      if (this.isPaused) {
+        this.report('Migración en pausa', totalItems, completed, failed, skipped);
+        return;
+      }
+
+      if (sub.status === 'completada') {
+        skipped++;
+        continue;
+      }
+
+      this.report(`Suscribiendo a: ${sub.title}...`, totalItems, completed, failed, skipped);
+
+      try {
+        const targetToken = getTargetToken();
+        const newSubId = await createSubscription(targetToken, sub.channelId);
+
+        sub.status = 'completada';
+        sub.targetSubscriptionId = newSubId;
+        await db.subscriptions.put(sub);
+        completed++;
+
+        // Delay de cortesía espaciado para respetar límites de YouTube
+        await this.delay(1200);
+      } catch (err: unknown) {
+        if (err instanceof YouTubeApiError) {
+          if (err.status === 401) {
+            this.pause();
+            this.report('Sesión expirada. Por favor renueva el token de destino.', totalItems, completed, failed, skipped, err.message);
+            throw err;
+          }
+
+          if (err.reason === 'subscriptionRateLimitExceeded') {
+            this.pause();
+            sub.status = 'fallida';
+            sub.errorMessage = 'Límite diario de suscripciones de YouTube alcanzado';
+            await db.subscriptions.put(sub);
+            this.report('Límite de suscripciones de YouTube alcanzado para hoy', totalItems, completed, failed, skipped, sub.errorMessage);
+            throw err;
+          }
+
+          if (err.reason === 'quotaExceeded' || err.message.includes('quota')) {
+            this.pause();
+            this.report('Cuota diaria de YouTube alcanzada (10.000 pts). Continúa mañana.', totalItems, completed, failed, skipped, 'Cuota diaria agotada');
+            throw err;
+          }
+        }
+
+        failed++;
+        sub.status = 'fallida';
+        sub.errorMessage = err instanceof Error ? err.message : 'Error desconocido';
+        await db.subscriptions.put(sub);
+      }
+    }
+
+    // 2. MIGRAR LISTAS DE REPRODUCCIÓN Y SUS VÍDEOS DESPUÉS
     for (const playlist of selectedPlaylists) {
       if (this.isPaused) {
         this.report('Migración en pausa', totalItems, completed, failed, skipped);
@@ -194,62 +250,6 @@ export class MigrationEngine {
 
       playlist.status = 'completada';
       await db.playlists.put(playlist);
-    }
-
-    // 2. MIGRAR SUSCRIPCIONES
-    for (const sub of selectedSubscriptions) {
-      if (this.isPaused) {
-        this.report('Migración en pausa', totalItems, completed, failed, skipped);
-        return;
-      }
-
-      if (sub.status === 'completada') {
-        skipped++;
-        continue;
-      }
-
-      this.report(`Suscribiendo a: ${sub.title}...`, totalItems, completed, failed, skipped);
-
-      try {
-        const targetToken = getTargetToken();
-        const newSubId = await createSubscription(targetToken, sub.channelId);
-
-        sub.status = 'completada';
-        sub.targetSubscriptionId = newSubId;
-        await db.subscriptions.put(sub);
-        completed++;
-
-        // Delay de cortesía espaciado para respetar límites de YouTube
-        await this.delay(1200);
-      } catch (err: unknown) {
-        if (err instanceof YouTubeApiError) {
-          if (err.status === 401) {
-            this.pause();
-            this.report('Sesión expirada. Por favor renueva el token de destino.', totalItems, completed, failed, skipped, err.message);
-            throw err;
-          }
-
-          if (err.reason === 'subscriptionRateLimitExceeded') {
-            this.pause();
-            sub.status = 'fallida';
-            sub.errorMessage = 'Límite diario de suscripciones de YouTube alcanzado';
-            await db.subscriptions.put(sub);
-            this.report('Límite de suscripciones de YouTube alcanzado para hoy', totalItems, completed, failed, skipped, sub.errorMessage);
-            throw err;
-          }
-
-          if (err.reason === 'quotaExceeded' || err.message.includes('quota')) {
-            this.pause();
-            this.report('Cuota diaria de YouTube alcanzada (10.000 pts). Continúa mañana.', totalItems, completed, failed, skipped, 'Cuota diaria agotada');
-            throw err;
-          }
-        }
-
-        failed++;
-        sub.status = 'fallida';
-        sub.errorMessage = err instanceof Error ? err.message : 'Error desconocido';
-        await db.subscriptions.put(sub);
-      }
     }
 
     this.report('¡Migración finalizada con éxito!', totalItems, completed, failed, skipped);
